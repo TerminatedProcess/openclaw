@@ -1,0 +1,34 @@
+## Email cleanup overlay — use with:
+##   docker compose -f docker-compose.yml -f docker-compose.email.yml up -d
+##
+## Uses host networking so container can reach claude-max-api-proxy on localhost:3456.
+## Mounts copied Vivaldi email data for AI processing.
+services:
+  openclaw-gateway:
+    network_mode: host
+    environment:
+      HOME: /home/node
+      TERM: xterm-256color
+      OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN}
+      OPENAI_API_KEY: "not-needed"
+      OPENAI_BASE_URL: "http://localhost:3456/v1"
+    volumes:
+      - ${OPENCLAW_CONFIG_DIR}:/home/node/.openclaw
+      - ${OPENCLAW_WORKSPACE_DIR}:/home/node/.openclaw/workspace
+      - ${OPENCLAW_DATA_DIR:-./data}:/home/node/.openclaw/data
+      - /home/dev/work/ai/clawroot/data/vivaldi-mail-copy:/home/node/email-data:ro
+
+  openclaw-cli:
+    network_mode: host
+    environment:
+      HOME: /home/node
+      TERM: xterm-256color
+      OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN}
+      BROWSER: echo
+      OPENAI_API_KEY: "not-needed"
+      OPENAI_BASE_URL: "http://localhost:3456/v1"
+    volumes:
+      - ${OPENCLAW_CONFIG_DIR}:/home/node/.openclaw
+      - ${OPENCLAW_WORKSPACE_DIR}:/home/node/.openclaw/workspace
+      - ${OPENCLAW_DATA_DIR:-./data}:/home/node/.openclaw/data
+      - /home/dev/work/ai/clawroot/data/vivaldi-mail-copy:/home/node/email-data:ro
