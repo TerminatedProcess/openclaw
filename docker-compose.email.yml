@@ -19,7 +19,7 @@ services:
     # NOT exposed to host — internal only
     volumes:
       - /home/dev/.claude/.credentials.json:/home/node/.claude/.credentials.json:ro
-      - /home/dev/work/ai/clawroot/data/vivaldi-mail-copy:/home/node/email-data:ro
+      - /home/dev/work/ai/clawroot/data/vivaldi-mail-copy:/home/node/email-data:rw
     environment:
       HOME: /home/node
       HOST: "0.0.0.0"
