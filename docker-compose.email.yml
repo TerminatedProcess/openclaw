@@ -1,17 +1,41 @@
 ## Email cleanup overlay — use with:
 ##   docker compose -f docker-compose.yml -f docker-compose.email.yml up -d
 ##
-## Uses host networking so container can reach claude-max-api-proxy on localhost:3456.
-## Mounts copied Vivaldi email data for AI processing.
+## Uses bridge networking for security — claude-proxy is sandboxed and only
+## accessible from within the openclaw-net network. The agent cannot reach
+## the host filesystem, SSH keys, or other services.
+
+networks:
+  openclaw-net:
+    driver: bridge
+
 services:
+  claude-proxy:
+    build:
+      context: ../claude-max-api-proxy
+      dockerfile: Dockerfile
+    networks:
+      - openclaw-net
+    # NOT exposed to host — internal only
+    volumes:
+      - /home/dev/.claude/.credentials.json:/home/node/.claude/.credentials.json:ro
+      - /home/dev/work/ai/clawroot/data/vivaldi-mail-copy:/home/node/email-data:ro
+    environment:
+      HOME: /home/node
+      HOST: "0.0.0.0"
+    init: true
+    restart: unless-stopped
+
   openclaw-gateway:
-    network_mode: host
+    networks:
+      - openclaw-net
+    # ports inherited from base docker-compose.yml (18789, 18790)
     environment:
       HOME: /home/node
       TERM: xterm-256color
       OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN}
       OPENAI_API_KEY: "not-needed"
-      OPENAI_BASE_URL: "http://localhost:3456/v1"
+      OPENAI_BASE_URL: "http://claude-proxy:3456/v1"
     volumes:
       - ${OPENCLAW_CONFIG_DIR}:/home/node/.openclaw
       - ${OPENCLAW_WORKSPACE_DIR}:/home/node/.openclaw/workspace
@@ -19,14 +43,15 @@ services:
       - /home/dev/work/ai/clawroot/data/vivaldi-mail-copy:/home/node/email-data:ro
 
   openclaw-cli:
-    network_mode: host
+    networks:
+      - openclaw-net
     environment:
       HOME: /home/node
       TERM: xterm-256color
       OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN}
       BROWSER: echo
       OPENAI_API_KEY: "not-needed"
-      OPENAI_BASE_URL: "http://localhost:3456/v1"
+      OPENAI_BASE_URL: "http://claude-proxy:3456/v1"
     volumes:
       - ${OPENCLAW_CONFIG_DIR}:/home/node/.openclaw
       - ${OPENCLAW_WORKSPACE_DIR}:/home/node/.openclaw/workspace
