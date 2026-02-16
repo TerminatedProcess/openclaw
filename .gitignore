@@ -79,6 +79,8 @@ USER.md
 
 # local tooling
 .serena/
+.claude/
+claude-openclaw
 
 # Agent credentials and memory (NEVER COMMIT)
 /memory/

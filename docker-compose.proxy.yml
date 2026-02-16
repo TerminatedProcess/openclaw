@@ -1,0 +1,37 @@
+## Proxy-mode overlay — use with:
+##   docker compose -f docker-compose.yml -f docker-compose.proxy.yml up -d
+##
+## Routes Anthropic LLM traffic through the host key-proxy.
+## The container never sees real API keys.
+services:
+  openclaw-gateway:
+    network_mode: host
+    environment:
+      HOME: /home/node
+      TERM: xterm-256color
+      OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN}
+      ## Deliberately empty — no real Anthropic keys enter the container
+      ANTHROPIC_API_KEY: ""
+      CLAUDE_AI_SESSION_KEY: ""
+      CLAUDE_WEB_SESSION_KEY: ""
+      CLAUDE_WEB_COOKIE: ""
+    volumes:
+      - ${OPENCLAW_CONFIG_DIR}:/home/node/.openclaw
+      - ${OPENCLAW_WORKSPACE_DIR}:/home/node/.openclaw/workspace
+      - ${OPENCLAW_DATA_DIR:-./data}:/home/node/.openclaw/data
+
+  openclaw-cli:
+    network_mode: host
+    environment:
+      HOME: /home/node
+      TERM: xterm-256color
+      OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN}
+      BROWSER: echo
+      ANTHROPIC_API_KEY: ""
+      CLAUDE_AI_SESSION_KEY: ""
+      CLAUDE_WEB_SESSION_KEY: ""
+      CLAUDE_WEB_COOKIE: ""
+    volumes:
+      - ${OPENCLAW_CONFIG_DIR}:/home/node/.openclaw
+      - ${OPENCLAW_WORKSPACE_DIR}:/home/node/.openclaw/workspace
+      - ${OPENCLAW_DATA_DIR:-./data}:/home/node/.openclaw/data
