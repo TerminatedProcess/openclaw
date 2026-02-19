@@ -1,13 +1,12 @@
-import { CURRENT_SESSION_VERSION, SessionManager } from "@mariozechner/pi-coding-agent";
 import fs from "node:fs";
 import path from "node:path";
-import type { MsgContext } from "../../auto-reply/templating.js";
-import type { GatewayRequestContext, GatewayRequestHandlers } from "./types.js";
+import { CURRENT_SESSION_VERSION, SessionManager } from "@mariozechner/pi-coding-agent";
 import { resolveSessionAgentId } from "../../agents/agent-scope.js";
 import { resolveThinkingDefault } from "../../agents/model-selection.js";
 import { resolveAgentTimeoutMs } from "../../agents/timeout.js";
 import { dispatchInboundMessage } from "../../auto-reply/dispatch.js";
 import { createReplyDispatcher } from "../../auto-reply/reply/reply-dispatcher.js";
+import type { MsgContext } from "../../auto-reply/templating.js";
 import { createReplyPrefixOptions } from "../../channels/reply-prefix.js";
 import { resolveSessionFilePath } from "../../config/sessions.js";
 import { resolveSendPolicy } from "../../sessions/send-policy.js";
@@ -16,6 +15,7 @@ import {
   abortChatRunById,
   abortChatRunsForSessionKey,
   type ChatAbortControllerEntry,
+  type ChatAbortOps,
   isChatStopCommandText,
   resolveChatRunExpiresAtMs,
 } from "../chat-abort.js";
@@ -41,6 +41,7 @@ import {
 import { formatForLog } from "../ws-log.js";
 import { injectTimestamp, timestampOptsFromConfig } from "./agent-timestamp.js";
 import { normalizeRpcAttachmentsToChatAttachments } from "./attachment-normalize.js";
+import type { GatewayRequestContext, GatewayRequestHandlers } from "./types.js";
 
 type TranscriptAppendResult = {
   ok: boolean;
@@ -58,6 +59,11 @@ type AbortedPartialSnapshot = {
   text: string;
   abortOrigin: AbortOrigin;
 };
+
+const CHAT_HISTORY_TEXT_MAX_CHARS = 12_000;
+const CHAT_HISTORY_MAX_SINGLE_MESSAGE_BYTES = 128 * 1024;
+const CHAT_HISTORY_OVERSIZED_PLACEHOLDER = "[chat.history omitted: message too large]";
+let chatHistoryPlaceholderEmitCount = 0;
 
 function stripDisallowedChatControlChars(message: string): string {
   let output = "";
@@ -78,6 +84,181 @@ export function sanitizeChatSendMessageInput(
     return { ok: false, error: "message must not contain null bytes" };
   }
   return { ok: true, message: stripDisallowedChatControlChars(normalized) };
+}
+
+function truncateChatHistoryText(text: string): { text: string; truncated: boolean } {
+  if (text.length <= CHAT_HISTORY_TEXT_MAX_CHARS) {
+    return { text, truncated: false };
+  }
+  return {
+    text: `${text.slice(0, CHAT_HISTORY_TEXT_MAX_CHARS)}\n...(truncated)...`,
+    truncated: true,
+  };
+}
+
+function sanitizeChatHistoryContentBlock(block: unknown): { block: unknown; changed: boolean } {
+  if (!block || typeof block !== "object") {
+    return { block, changed: false };
+  }
+  const entry = { ...(block as Record<string, unknown>) };
+  let changed = false;
+  if (typeof entry.text === "string") {
+    const res = truncateChatHistoryText(entry.text);
+    entry.text = res.text;
+    changed ||= res.truncated;
+  }
+  if (typeof entry.partialJson === "string") {
+    const res = truncateChatHistoryText(entry.partialJson);
+    entry.partialJson = res.text;
+    changed ||= res.truncated;
+  }
+  if (typeof entry.arguments === "string") {
+    const res = truncateChatHistoryText(entry.arguments);
+    entry.arguments = res.text;
+    changed ||= res.truncated;
+  }
+  if (typeof entry.thinking === "string") {
+    const res = truncateChatHistoryText(entry.thinking);
+    entry.thinking = res.text;
+    changed ||= res.truncated;
+  }
+  if ("thinkingSignature" in entry) {
+    delete entry.thinkingSignature;
+    changed = true;
+  }
+  const type = typeof entry.type === "string" ? entry.type : "";
+  if (type === "image" && typeof entry.data === "string") {
+    const bytes = Buffer.byteLength(entry.data, "utf8");
+    delete entry.data;
+    entry.omitted = true;
+    entry.bytes = bytes;
+    changed = true;
+  }
+  return { block: changed ? entry : block, changed };
+}
+
+function sanitizeChatHistoryMessage(message: unknown): { message: unknown; changed: boolean } {
+  if (!message || typeof message !== "object") {
+    return { message, changed: false };
+  }
+  const entry = { ...(message as Record<string, unknown>) };
+  let changed = false;
+
+  if ("details" in entry) {
+    delete entry.details;
+    changed = true;
+  }
+  if ("usage" in entry) {
+    delete entry.usage;
+    changed = true;
+  }
+  if ("cost" in entry) {
+    delete entry.cost;
+    changed = true;
+  }
+
+  if (typeof entry.content === "string") {
+    const res = truncateChatHistoryText(entry.content);
+    entry.content = res.text;
+    changed ||= res.truncated;
+  } else if (Array.isArray(entry.content)) {
+    const updated = entry.content.map((block) => sanitizeChatHistoryContentBlock(block));
+    if (updated.some((item) => item.changed)) {
+      entry.content = updated.map((item) => item.block);
+      changed = true;
+    }
+  }
+
+  if (typeof entry.text === "string") {
+    const res = truncateChatHistoryText(entry.text);
+    entry.text = res.text;
+    changed ||= res.truncated;
+  }
+
+  return { message: changed ? entry : message, changed };
+}
+
+function sanitizeChatHistoryMessages(messages: unknown[]): unknown[] {
+  if (messages.length === 0) {
+    return messages;
+  }
+  let changed = false;
+  const next = messages.map((message) => {
+    const res = sanitizeChatHistoryMessage(message);
+    changed ||= res.changed;
+    return res.message;
+  });
+  return changed ? next : messages;
+}
+
+function jsonUtf8Bytes(value: unknown): number {
+  try {
+    return Buffer.byteLength(JSON.stringify(value), "utf8");
+  } catch {
+    return Buffer.byteLength(String(value), "utf8");
+  }
+}
+
+function buildOversizedHistoryPlaceholder(message?: unknown): Record<string, unknown> {
+  const role =
+    message &&
+    typeof message === "object" &&
+    typeof (message as { role?: unknown }).role === "string"
+      ? (message as { role: string }).role
+      : "assistant";
+  const timestamp =
+    message &&
+    typeof message === "object" &&
+    typeof (message as { timestamp?: unknown }).timestamp === "number"
+      ? (message as { timestamp: number }).timestamp
+      : Date.now();
+  return {
+    role,
+    timestamp,
+    content: [{ type: "text", text: CHAT_HISTORY_OVERSIZED_PLACEHOLDER }],
+    __openclaw: { truncated: true, reason: "oversized" },
+  };
+}
+
+function replaceOversizedChatHistoryMessages(params: {
+  messages: unknown[];
+  maxSingleMessageBytes: number;
+}): { messages: unknown[]; replacedCount: number } {
+  const { messages, maxSingleMessageBytes } = params;
+  if (messages.length === 0) {
+    return { messages, replacedCount: 0 };
+  }
+  let replacedCount = 0;
+  const next = messages.map((message) => {
+    if (jsonUtf8Bytes(message) <= maxSingleMessageBytes) {
+      return message;
+    }
+    replacedCount += 1;
+    return buildOversizedHistoryPlaceholder(message);
+  });
+  return { messages: replacedCount > 0 ? next : messages, replacedCount };
+}
+
+function enforceChatHistoryFinalBudget(params: { messages: unknown[]; maxBytes: number }): {
+  messages: unknown[];
+  placeholderCount: number;
+} {
+  const { messages, maxBytes } = params;
+  if (messages.length === 0) {
+    return { messages, placeholderCount: 0 };
+  }
+  if (jsonUtf8Bytes(messages) <= maxBytes) {
+    return { messages, placeholderCount: 0 };
+  }
+  const last = messages.at(-1);
+  if (last && jsonUtf8Bytes([last]) <= maxBytes) {
+    return { messages: [last], placeholderCount: 0 };
+  }
+  const placeholder = buildOversizedHistoryPlaceholder(last);
+  if (jsonUtf8Bytes([placeholder]) <= maxBytes) {
+    return { messages: [placeholder], placeholderCount: 1 };
+  }
+  return { messages: [], placeholderCount: 0 };
 }
 
 function resolveTranscriptPath(params: {
@@ -118,7 +299,10 @@ function ensureTranscriptFile(params: { transcriptPath: string; sessionId: strin
       timestamp: new Date().toISOString(),
       cwd: process.cwd(),
     };
-    fs.writeFileSync(params.transcriptPath, `${JSON.stringify(header)}\n`, "utf-8");
+    fs.writeFileSync(params.transcriptPath, `${JSON.stringify(header)}\n`, {
+      encoding: "utf-8",
+      mode: 0o600,
+    });
     return { ok: true };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
@@ -293,6 +477,46 @@ function persistAbortedPartials(params: {
   }
 }
 
+function createChatAbortOps(context: GatewayRequestContext): ChatAbortOps {
+  return {
+    chatAbortControllers: context.chatAbortControllers,
+    chatRunBuffers: context.chatRunBuffers,
+    chatDeltaSentAt: context.chatDeltaSentAt,
+    chatAbortedRuns: context.chatAbortedRuns,
+    removeChatRun: context.removeChatRun,
+    agentRunSeq: context.agentRunSeq,
+    broadcast: context.broadcast,
+    nodeSendToSession: context.nodeSendToSession,
+  };
+}
+
+function abortChatRunsForSessionKeyWithPartials(params: {
+  context: GatewayRequestContext;
+  ops: ChatAbortOps;
+  sessionKey: string;
+  abortOrigin: AbortOrigin;
+  stopReason?: string;
+}) {
+  const snapshots = collectSessionAbortPartials({
+    chatAbortControllers: params.context.chatAbortControllers,
+    chatRunBuffers: params.context.chatRunBuffers,
+    sessionKey: params.sessionKey,
+    abortOrigin: params.abortOrigin,
+  });
+  const res = abortChatRunsForSessionKey(params.ops, {
+    sessionKey: params.sessionKey,
+    stopReason: params.stopReason,
+  });
+  if (res.aborted) {
+    persistAbortedPartials({
+      context: params.context,
+      sessionKey: params.sessionKey,
+      snapshots,
+    });
+  }
+  return res;
+}
+
 function nextChatSeq(context: { agentRunSeq: Map<string, number> }, runId: string) {
   const next = (context.agentRunSeq.get(runId) ?? 0) + 1;
   context.agentRunSeq.set(runId, next);
@@ -364,7 +588,22 @@ export const chatHandlers: GatewayRequestHandlers = {
     const max = Math.min(hardMax, requested);
     const sliced = rawMessages.length > max ? rawMessages.slice(-max) : rawMessages;
     const sanitized = stripEnvelopeFromMessages(sliced);
-    const capped = capArrayByJsonBytes(sanitized, getMaxChatHistoryMessagesBytes()).items;
+    const normalized = sanitizeChatHistoryMessages(sanitized);
+    const maxHistoryBytes = getMaxChatHistoryMessagesBytes();
+    const perMessageHardCap = Math.min(CHAT_HISTORY_MAX_SINGLE_MESSAGE_BYTES, maxHistoryBytes);
+    const replaced = replaceOversizedChatHistoryMessages({
+      messages: normalized,
+      maxSingleMessageBytes: perMessageHardCap,
+    });
+    const capped = capArrayByJsonBytes(replaced.messages, maxHistoryBytes).items;
+    const bounded = enforceChatHistoryFinalBudget({ messages: capped, maxBytes: maxHistoryBytes });
+    const placeholderCount = replaced.replacedCount + bounded.placeholderCount;
+    if (placeholderCount > 0) {
+      chatHistoryPlaceholderEmitCount += placeholderCount;
+      context.logGateway.debug(
+        `chat.history omitted oversized payloads placeholders=${placeholderCount} total=${chatHistoryPlaceholderEmitCount}`,
+      );
+    }
     let thinkingLevel = entry?.thinkingLevel;
     if (!thinkingLevel) {
       const configured = cfg.agents?.defaults?.thinkingDefault;
@@ -386,7 +625,7 @@ export const chatHandlers: GatewayRequestHandlers = {
     respond(true, {
       sessionKey,
       sessionId,
-      messages: capped,
+      messages: bounded.messages,
       thinkingLevel,
       verboseLevel,
     });
@@ -408,35 +647,16 @@ export const chatHandlers: GatewayRequestHandlers = {
       runId?: string;
     };
 
-    const ops = {
-      chatAbortControllers: context.chatAbortControllers,
-      chatRunBuffers: context.chatRunBuffers,
-      chatDeltaSentAt: context.chatDeltaSentAt,
-      chatAbortedRuns: context.chatAbortedRuns,
-      removeChatRun: context.removeChatRun,
-      agentRunSeq: context.agentRunSeq,
-      broadcast: context.broadcast,
-      nodeSendToSession: context.nodeSendToSession,
-    };
+    const ops = createChatAbortOps(context);
 
     if (!runId) {
-      const snapshots = collectSessionAbortPartials({
-        chatAbortControllers: context.chatAbortControllers,
-        chatRunBuffers: context.chatRunBuffers,
+      const res = abortChatRunsForSessionKeyWithPartials({
+        context,
+        ops,
         sessionKey: rawSessionKey,
         abortOrigin: "rpc",
-      });
-      const res = abortChatRunsForSessionKey(ops, {
-        sessionKey: rawSessionKey,
         stopReason: "rpc",
       });
-      if (res.aborted) {
-        persistAbortedPartials({
-          context,
-          sessionKey: rawSessionKey,
-          snapshots,
-        });
-      }
       respond(true, { ok: true, aborted: res.aborted, runIds: res.runIds });
       return;
     }
@@ -569,32 +789,13 @@ export const chatHandlers: GatewayRequestHandlers = {
     }
 
     if (stopCommand) {
-      const snapshots = collectSessionAbortPartials({
-        chatAbortControllers: context.chatAbortControllers,
-        chatRunBuffers: context.chatRunBuffers,
+      const res = abortChatRunsForSessionKeyWithPartials({
+        context,
+        ops: createChatAbortOps(context),
         sessionKey: rawSessionKey,
         abortOrigin: "stop-command",
+        stopReason: "stop",
       });
-      const res = abortChatRunsForSessionKey(
-        {
-          chatAbortControllers: context.chatAbortControllers,
-          chatRunBuffers: context.chatRunBuffers,
-          chatDeltaSentAt: context.chatDeltaSentAt,
-          chatAbortedRuns: context.chatAbortedRuns,
-          removeChatRun: context.removeChatRun,
-          agentRunSeq: context.agentRunSeq,
-          broadcast: context.broadcast,
-          nodeSendToSession: context.nodeSendToSession,
-        },
-        { sessionKey: rawSessionKey, stopReason: "stop" },
-      );
-      if (res.aborted) {
-        persistAbortedPartials({
-          context,
-          sessionKey: rawSessionKey,
-          snapshots,
-        });
-      }
       respond(true, { ok: true, aborted: res.aborted, runIds: res.runIds });
       return;
     }
@@ -697,7 +898,6 @@ export const chatHandlers: GatewayRequestHandlers = {
           runId: clientRunId,
           abortSignal: abortController.signal,
           images: parsedImages.length > 0 ? parsedImages : undefined,
-          disableBlockStreaming: true,
           onAgentRunStart: (runId) => {
             agentRunStarted = true;
             const connId = typeof client?.connId === "string" ? client.connId : undefined;
